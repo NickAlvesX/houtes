@@ -9,6 +9,7 @@ const CELL_MAX := 68.0
 const BASE_CELL := 60.0
 const STEP_DURATION := 0.22
 const FAST_FORWARD_SCALE := 3.0
+const MINUTES_PER_TICK := 1
 
 const ASPHALT := Color(0.24, 0.24, 0.27)
 const LANE_LINE := Color(0.92, 0.92, 0.86, 0.9)
@@ -23,18 +24,27 @@ const ROOF_COLORS := [
 const SCHOOL_COLOR := Color(0.42, 0.52, 0.64)
 const MARKET_COLOR := Color(0.85, 0.68, 0.22)
 
-enum State { DRAWING, PLAYING, CRASHED, WON }
+# FAILED is distinct from CRASHED: no car hit another, but something else
+# went wrong during the drive (ran out of fuel, broke a condition, arrived
+# late) — see _run_simulation()'s post-drive check and violations below.
+enum State { DRAWING, PLAYING, CRASHED, FAILED, WON }
 
 # A car's grid coordinates are stored as Vector2i(row, col), both 1-based.
 # Exactly one of entry.row / entry.col is 0 — that marks which edge the car
 # enters from, and the car itself sits one cell outside the grid there.
 # move_ticks is how many simulation ticks it takes to cross one cell (lower =
-# faster). fuel is the max number of path cells the car can be given (-1 =
-# unlimited). conditions is a list of extra drawing/completion rules — see
-# _violates_live_conditions() and _check_ready() for the supported types:
+# faster) — and, since 1 tick = 1 in-game minute (see MINUTES_PER_TICK), also
+# how many in-game minutes that costs, before any radar on the way slows it
+# down further. fuel is the max number of path cells the car can be given
+# (-1 = unlimited) — nothing stops the player from drawing past it; running
+# out just strands the car on the street during the drive (see
+# _run_simulation()). conditions is a list of extra rules, all checked only
+# once Play is pressed — not while drawing — and surfaced afterwards as a
+# per-car violation note rather than blocking anything (see violations):
 #   {"type": "avoid_car", "other": <car id>}      — never share a cell with that car's road
 #   {"type": "avoid_building", "name": <landmark>} — never use that landmark's frontage cell
 #   {"type": "require_building", "name": <landmark>} — must pass through its frontage cell
+#   {"type": "arrive_by", "minutes": <minutes since midnight>} — must reach the house by this in-game time
 class CarDef:
 	var id: String
 	var color: Color
@@ -64,6 +74,8 @@ class LevelDef:
 	var road_rows: Dictionary
 	var road_cols: Dictionary
 	var landmarks: Array = []
+	var radars: Array = []
+	var start_minutes: int = 660
 
 var LEVELS: Array = []
 var current_level_index: int = 0
@@ -77,6 +89,8 @@ var car_defs: Array = []
 var road_rows: Dictionary = {}
 var road_cols: Dictionary = {}
 var landmarks: Array = []
+var radars: Array = []
+var level_start_minutes: int = 660
 var blocks: Array = []
 var block_decor: Array = []
 var paths: Dictionary = {}
@@ -89,11 +103,18 @@ var _last_drag_pos: Vector2 = Vector2.ZERO
 var hovered_car_id: String = ""
 var overlay: Overlay = null
 
+# car id -> Array[String] of problems found after a non-crashed drive (ran
+# out of fuel, broke a condition, arrived late). Persists on screen (see
+# overlay.gd) until Reset/Clear/a level change explicitly clears it.
+var violations: Dictionary = {}
+
 @onready var play_button: Button = $UI/PlayButton
 @onready var clear_button: Button = $UI/ClearButton
 @onready var reset_button: Button = $UI/ResetButton
 @onready var next_button: Button = $UI/NextButton
+@onready var prev_button: Button = $UI/PrevButton
 @onready var status_label: Label = $UI/StatusLabel
+@onready var clock_label: Label = $UI/ClockLabel
 
 
 func _ready() -> void:
@@ -102,6 +123,7 @@ func _ready() -> void:
 	clear_button.pressed.connect(_on_clear_pressed)
 	reset_button.pressed.connect(_on_reset_pressed)
 	next_button.pressed.connect(_on_next_pressed)
+	prev_button.pressed.connect(_on_prev_pressed)
 
 	overlay = Overlay.new()
 	overlay.board = self
@@ -147,6 +169,45 @@ func _make_car(id: String, color: Color, entry: Vector2i, house: Vector2i,
 
 func _make_landmark(name: String, cell: Vector2i, road_cell: Vector2i, color: Color) -> Dictionary:
 	return {"name": name, "cell": cell, "road_cell": road_cell, "color": color}
+
+
+func _make_radar(cell: Vector2i, speed_ticks: int) -> Dictionary:
+	return {"cell": cell, "speed_ticks": speed_ticks}
+
+
+# HH:MM, purely for readability when authoring level data below.
+func _time(hh: int, mm: int) -> int:
+	return hh * 60 + mm
+
+
+func _format_time(total_minutes: int) -> String:
+	var m: int = ((total_minutes % 1440) + 1440) % 1440
+	return "%02d:%02d" % [m / 60, m % 60]
+
+
+func _find_radar(cell: Vector2i):
+	for r in radars:
+		if r.cell == cell:
+			return r
+	return null
+
+
+# The ticks a move into `to_cell` actually costs: the car's own pace, unless
+# a radar guards that cell and enforces a slower (higher-tick) limit — a
+# radar can only slow a car down, never speed it past its own top speed.
+func _move_ticks_for(d: CarDef, to_cell: Vector2i) -> int:
+	var ticks: int = max(1, d.move_ticks)
+	var radar = _find_radar(to_cell)
+	if radar != null:
+		ticks = max(ticks, radar.speed_ticks)
+	return ticks
+
+
+func _arrive_by_minutes(d: CarDef) -> int:
+	for cond in d.conditions:
+		if cond.type == "arrive_by":
+			return cond.minutes
+	return -1
 
 
 # The non-road cell next to a house's road-cell destination where the House
@@ -253,6 +314,26 @@ func _build_levels() -> void:
 	_assign_house_cells(level5)
 	LEVELS.append(level5)
 
+	# Level 6: introduces the clock. Blue is normally fast (60km/h) but its
+	# most direct route to the house runs straight through a radar enforcing
+	# 20km/h — budget for that slowdown or miss the 11:54 deadline. Red is a
+	# plain, unconstrained car for contrast; the radar doesn't touch its route.
+	var level6 := LevelDef.new()
+	level6.grid_size = 8
+	level6.start_minutes = _time(11, 40)
+	level6.cars = [
+		_make_car("red", Color(0.85, 0.2, 0.2), Vector2i(0, 2), Vector2i(8, 6)),
+		_make_car("blue", Color(0.2, 0.45, 0.9), Vector2i(5, 0), Vector2i(2, 8), 1, -1,
+			[{"type": "arrive_by", "minutes": _time(11, 54)}]),
+	]
+	level6.road_rows = _set_from([1, 4, 8])
+	level6.road_cols = _set_from([1, 4, 8])
+	level6.radars = [
+		_make_radar(Vector2i(4, 5), 3),
+	]
+	_assign_house_cells(level6)
+	LEVELS.append(level6)
+
 
 func _load_level(index: int) -> void:
 	current_level_index = index
@@ -261,9 +342,19 @@ func _load_level(index: int) -> void:
 	road_rows = level.road_rows
 	road_cols = level.road_cols
 	landmarks = level.landmarks
+	radars = level.radars
+	level_start_minutes = level.start_minutes
 	_layout_grid(level.grid_size)
 	blocks = _compute_blocks(road_rows, road_cols)
 	_generate_block_decor()
+
+	var has_deadline := false
+	for d in car_defs:
+		if _arrive_by_minutes(d) >= 0:
+			has_deadline = true
+			break
+	clock_label.visible = has_deadline
+	_update_clock(level_start_minutes)
 
 	paths = {}
 	for d in car_defs:
@@ -295,9 +386,10 @@ func _load_level(index: int) -> void:
 	state = State.DRAWING
 	drawing_car_id = ""
 	hovered_car_id = ""
+	violations = {}
 	reset_button.hide()
-	next_button.hide()
 	clear_button.disabled = false
+	_update_nav_buttons()
 	_check_ready()
 	_redraw_all()
 
@@ -539,20 +631,12 @@ func _extend_drag(pos: Vector2) -> void:
 	_last_drag_pos = pos
 
 
-func _violates_live_conditions(d: CarDef, cell: Vector2i) -> bool:
-	for cond in d.conditions:
-		match cond.type:
-			"avoid_car":
-				var other: Array = paths.get(cond.other, [])
-				if other.has(cell):
-					return true
-			"avoid_building":
-				var lm = _find_landmark(cond.name)
-				if lm != null and cell == lm.road_cell:
-					return true
-	return false
-
-
+# Fuel, avoid/require-building, avoid-car and arrive-by are all deliberately
+# NOT enforced here — the player can draw any connected road they like and
+# only finds out at Play time whether it actually worked (see
+# _run_simulation()'s post-drive violations check). The only things that
+# still matter while drawing are the physical ones: stay on road, stay
+# adjacent, don't revisit a cell except to trim back along your own road.
 func _apply_drag_point(d: CarDef, pos: Vector2) -> void:
 	var cell := world_to_cell(pos)
 	if cell == Vector2i(-1, -1) or not is_road(cell):
@@ -572,10 +656,6 @@ func _apply_drag_point(d: CarDef, pos: Vector2) -> void:
 
 	if not _is_adjacent(path[-1], cell):
 		return
-	if d.fuel >= 0 and path.size() + 1 > d.fuel:
-		return
-	if _violates_live_conditions(d, cell):
-		return
 
 	path.append(cell)
 	_redraw_all()
@@ -589,30 +669,21 @@ func _end_drag() -> void:
 	_check_ready()
 
 
+# Only checks that every car's road actually reaches its house — fuel,
+# conditions and deadlines are no longer gates on Play (see
+# _apply_drag_point()'s comment); they're discovered after the drive instead.
 func _check_ready() -> void:
 	if state != State.DRAWING:
 		return
 	var all_done := true
-	var missing: Array = []
 	for d in car_defs:
 		var p: Array = paths[d.id]
 		if p.is_empty() or p[-1] != d.house:
 			all_done = false
-			continue
-		for cond in d.conditions:
-			if cond.type == "require_building":
-				var lm = _find_landmark(cond.name)
-				if lm == null or not p.has(lm.road_cell):
-					all_done = false
-					missing.append("%s must pass by the %s" % [d.id.capitalize(), cond.name])
 	play_button.disabled = not all_done
 	var prefix := "Level %d — " % (current_level_index + 1)
-	if all_done:
-		status_label.text = prefix + "All roads are ready. Press Play!"
-	elif missing.size() > 0:
-		status_label.text = prefix + missing[0] + "."
-	else:
-		status_label.text = prefix + "Draw a road from each car to its matching house."
+	status_label.text = prefix + ("All roads are ready. Press Play!" if all_done \
+		else "Draw a road from each car to its matching house.")
 
 
 # move_ticks is ticks-per-cell (lower = faster); expressed here as a plain
@@ -624,10 +695,7 @@ func _speed_kmh(move_ticks: int) -> int:
 func _car_tooltip_lines(d: CarDef) -> Array:
 	var lines: Array = [d.id.capitalize()]
 	lines.append("Speed: %dkm/h" % _speed_kmh(d.move_ticks))
-	if d.fuel >= 0:
-		lines.append("Fuel: %d/%d cells" % [paths[d.id].size(), d.fuel])
-	else:
-		lines.append("Fuel: unlimited")
+	lines.append("Fuel: %d cells" % d.fuel if d.fuel >= 0 else "Fuel: unlimited")
 	for cond in d.conditions:
 		match cond.type:
 			"avoid_car":
@@ -636,6 +704,8 @@ func _car_tooltip_lines(d: CarDef) -> Array:
 				lines.append("Avoid the %s" % cond.name)
 			"require_building":
 				lines.append("Must pass by the %s" % cond.name)
+			"arrive_by":
+				lines.append("Home by %s" % _format_time(cond.minutes))
 	return lines
 
 
@@ -661,6 +731,8 @@ func _draw() -> void:
 				_draw_crosswalk(cell_to_world(item.cell.x, item.cell.y), item.horizontal_road)
 			"landmark":
 				_draw_landmark(item.rect, item.color)
+	for r in radars:
+		_draw_radar(r.cell, r.speed_ticks)
 	for d in car_defs:
 		_draw_start_highlight(d)
 	for d in car_defs:
@@ -718,6 +790,23 @@ func _draw_crosswalk(center: Vector2, horizontal_road: bool) -> void:
 			draw_line(center + Vector2(-bar_len * 0.5, t), center + Vector2(bar_len * 0.5, t), LANE_LINE, 5.0 * draw_scale)
 		else:
 			draw_line(center + Vector2(t, -bar_len * 0.5), center + Vector2(t, bar_len * 0.5), LANE_LINE, 5.0 * draw_scale)
+
+
+# A round speed-limit sign sitting on the road cell it guards — white face,
+# red ring, the km/h limit in the middle, like a real traffic sign. It's its
+# own opaque background (the circle), so unlike the landmark name it's fine
+# drawn in the normal pass even though a car will later drive over it.
+func _draw_radar(cell: Vector2i, speed_ticks: int) -> void:
+	var center := cell_to_world(cell.x, cell.y)
+	var r := cell_size * 0.24
+	draw_circle(center, r, Color(0.96, 0.96, 0.96))
+	draw_circle(center, r, Color(0.78, 0.12, 0.12), false, 3.0 * draw_scale)
+	var text := "%d" % _speed_kmh(speed_ticks)
+	var font := ThemeDB.fallback_font
+	var font_size := int(round(11 * draw_scale))
+	var text_size := font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size)
+	var text_pos := Vector2(center.x - text_size.x * 0.5, center.y + text_size.y * 0.32)
+	draw_string(font, text_pos, text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, Color(0.1, 0.1, 0.1))
 
 
 func _draw_building(rect: Rect2, color: Color) -> void:
@@ -800,6 +889,10 @@ func _draw_path(d: CarDef) -> void:
 
 # ---- Simulation ----
 
+func _update_clock(minutes: int) -> void:
+	clock_label.text = "Time: %s" % _format_time(minutes)
+
+
 func _on_play_pressed() -> void:
 	if state != State.DRAWING:
 		return
@@ -807,22 +900,29 @@ func _on_play_pressed() -> void:
 	play_button.disabled = true
 	clear_button.disabled = true
 	reset_button.hide()
-	next_button.hide()
+	_update_nav_buttons()
 	status_label.text = "Cars are on their way..."
 	await _run_simulation()
 
 
-# Expands a car's cell-by-cell path into a per-tick occupancy timeline: each
-# move now takes move_ticks ticks, dwelling at the source cell before
-# jumping to the destination on the final tick of that move. A move_ticks=1
-# car is unaffected (expanded sequence == original sequence).
-func _expand_sequence(seq: Array, move_ticks: int) -> Array:
-	var expanded := [seq[0]]
-	for i in range(1, seq.size()):
-		for _k in range(move_ticks - 1):
-			expanded.append(seq[i - 1])
-		expanded.append(seq[i])
-	return expanded
+# Expands a car's cell-by-cell route into a per-tick occupancy timeline: each
+# move takes however many ticks that specific step costs (the car's own pace,
+# or slower if a radar guards the cell being entered — see _move_ticks_for),
+# dwelling at the source cell before jumping to the destination on the move's
+# last tick. Since 1 tick = 1 in-game minute, this also doubles as exactly
+# the timeline an arrive_by deadline gets checked against — including the
+# tick index at which the car reaches its actual house (not house_cell).
+func _expand_car_sequence(d: CarDef, raw: Array) -> Dictionary:
+	var expanded := [raw[0]]
+	var arrival_tick := -1
+	for i in range(1, raw.size()):
+		var ticks: int = _move_ticks_for(d, raw[i])
+		for _k in range(ticks - 1):
+			expanded.append(raw[i - 1])
+		expanded.append(raw[i])
+		if raw[i] == d.house and arrival_tick == -1:
+			arrival_tick = expanded.size() - 1
+	return {"sequence": expanded, "arrival_tick": arrival_tick}
 
 
 func _run_simulation() -> void:
@@ -830,13 +930,58 @@ func _run_simulation() -> void:
 	# road, and on into its house — house_cell is a private, non-road cell no
 	# other car's path can ever touch, so a car that finishes early keeps
 	# going into its driveway immediately instead of idling in the street
-	# until every other car has also arrived.
+	# until every other car has also arrived. A car that was drawn past its
+	# fuel limit gets its road truncated right there — it never gets the
+	# house_cell leg, so it just stops and stays put on the street.
 	var sequences := {}
+	var arrival_ticks := {}
+	var ran_out_of_fuel := {}
+	var active_tweens: Dictionary = {}
 	for d in car_defs:
+		var drawn: Array = paths[d.id]
+		var out_of_fuel: bool = d.fuel >= 0 and drawn.size() > d.fuel
+		ran_out_of_fuel[d.id] = out_of_fuel
+		var effective_path: Array = drawn.slice(0, d.fuel) if out_of_fuel else drawn
+
 		var raw: Array = [d.entry]
-		raw.append_array(paths[d.id])
-		raw.append(d.house_cell)
-		sequences[d.id] = _expand_sequence(raw, max(1, d.move_ticks))
+		raw.append_array(effective_path)
+		if not out_of_fuel:
+			raw.append(d.house_cell)
+
+		var expanded := _expand_car_sequence(d, raw)
+		sequences[d.id] = expanded.sequence
+		arrival_ticks[d.id] = expanded.arrival_tick
+
+		# One continuous tween per car, legs chained in order — each leg's own
+		# duration already reflects that specific move's speed (car's own pace,
+		# or a radar's slower limit), and chaining guarantees they always play
+		# strictly one-after-another, which is what keeps this glitch-free: a
+		# fresh tween created mid-loop for every move (the old approach) could
+		# start before the previous, slower move's tween had actually finished.
+		#
+		# Easing is only applied where the speed actually changes — pulling
+		# away from a stop, into/out of a radar zone, parking at the house —
+		# not on every leg uniformly, or consecutive same-speed legs would
+		# each decelerate and reaccelerate at their shared cell boundary
+		# instead of flowing through it at a constant pace.
+		var leg_ticks: Array = []
+		for i in range(1, raw.size()):
+			leg_ticks.append(_move_ticks_for(d, raw[i]))
+
+		var tw := create_tween()
+		for i in range(leg_ticks.size()):
+			var target: Vector2 = cell_to_world(raw[i + 1].x, raw[i + 1].y)
+			var duration: float = STEP_DURATION * leg_ticks[i]
+			var ease_in: bool = i == 0 or leg_ticks[i] != leg_ticks[i - 1]
+			var ease_out: bool = i == leg_ticks.size() - 1 or leg_ticks[i] != leg_ticks[i + 1]
+			var tweener := tw.tween_property(car_nodes[d.id], "position", target, duration)
+			if ease_in and ease_out:
+				tweener.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+			elif ease_in:
+				tweener.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN)
+			elif ease_out:
+				tweener.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_OUT)
+		active_tweens[d.id] = tw
 
 	var max_len := 0
 	for id in sequences.keys():
@@ -845,6 +990,8 @@ func _run_simulation() -> void:
 		var seq: Array = sequences[id]
 		while seq.size() < max_len:
 			seq.append(seq[-1])
+
+	_update_clock(level_start_minutes)
 
 	var crashed := false
 	var step := 1
@@ -865,32 +1012,26 @@ func _run_simulation() -> void:
 					swap_pos = cell_to_world(a_prev.x, a_prev.y).lerp(cell_to_world(a_next.x, a_next.y), 0.5)
 
 		if swap_pos != null:
+			_kill_tweens(active_tweens)
 			for d in car_defs:
 				var seq: Array = sequences[d.id]
 				if seq[step] != seq[step - 1]:
-					var car: Car = car_nodes[d.id]
 					var tw := create_tween()
-					tw.tween_property(car, "position", swap_pos, STEP_DURATION * 0.5)
+					tw.tween_property(car_nodes[d.id], "position", swap_pos, STEP_DURATION * 0.5)
 			await get_tree().create_timer(STEP_DURATION * 0.5).timeout
 			crashed = true
 			_spawn_crash_marker(swap_pos)
 			break
 
-		for d in car_defs:
-			var seq: Array = sequences[d.id]
-			var prev_cell: Vector2i = seq[step - 1]
-			var target_cell: Vector2i = seq[step]
-			if target_cell != prev_cell:
-				var car: Car = car_nodes[d.id]
-				var tw := create_tween()
-				tw.tween_property(car, "position", cell_to_world(target_cell.x, target_cell.y), STEP_DURATION * max(1, d.move_ticks))
 		await get_tree().create_timer(STEP_DURATION).timeout
+		_update_clock(level_start_minutes + step * MINUTES_PER_TICK)
 
 		var occupied := {}
 		for d in car_defs:
 			var cell: Vector2i = sequences[d.id][step]
 			if occupied.has(cell):
 				crashed = true
+				_kill_tweens(active_tweens)
 				_spawn_crash_marker(cell_to_world(cell.x, cell.y))
 				break
 			occupied[cell] = true
@@ -902,12 +1043,70 @@ func _run_simulation() -> void:
 		status_label.text = "Crash! The cars collided. Press Reset to try again."
 		reset_button.show()
 	else:
-		state = State.WON
-		if current_level_index + 1 < LEVELS.size():
-			status_label.text = "You win! Press Next to continue."
-			next_button.show()
+		violations = _collect_violations(ran_out_of_fuel, arrival_ticks)
+		if violations.size() > 0:
+			state = State.FAILED
+			status_label.text = "Trouble on the road — see the notes below. Press Reset to try again."
+			reset_button.show()
 		else:
-			status_label.text = "You win! All levels complete."
+			state = State.WON
+			if current_level_index + 1 < LEVELS.size():
+				status_label.text = "You win! Press Next to continue."
+			else:
+				status_label.text = "You win! All levels complete."
+	_update_nav_buttons()
+	overlay.queue_redraw()
+
+
+# Checked only now, after the drive, instead of gating Play — see
+# _apply_drag_point()'s comment for why. Each message is written as what
+# actually happened, not as a rule restated.
+func _collect_violations(ran_out_of_fuel: Dictionary, arrival_ticks: Dictionary) -> Dictionary:
+	var result := {}
+	for d in car_defs:
+		var msgs: Array = []
+		if ran_out_of_fuel[d.id]:
+			msgs.append("Ran out of fuel")
+		for cond in d.conditions:
+			match cond.type:
+				"avoid_car":
+					var other_path: Array = paths[cond.other]
+					for c in paths[d.id]:
+						if other_path.has(c):
+							msgs.append("Crossed %s's road" % _get_car_def(cond.other).id.capitalize())
+							break
+				"avoid_building":
+					var lm = _find_landmark(cond.name)
+					if lm != null and paths[d.id].has(lm.road_cell):
+						msgs.append("Drove past the %s" % cond.name)
+				"require_building":
+					var lm2 = _find_landmark(cond.name)
+					if lm2 == null or not paths[d.id].has(lm2.road_cell):
+						msgs.append("Never passed by the %s" % cond.name)
+				"arrive_by":
+					# Already covered by the fuel message above if that's why
+					# it never got home — no need to say "never arrived" twice.
+					if not ran_out_of_fuel[d.id]:
+						var arrival: int = arrival_ticks[d.id]
+						if arrival == -1:
+							msgs.append("Never made it home")
+						else:
+							var arrival_time: int = level_start_minutes + arrival
+							if arrival_time > cond.minutes:
+								msgs.append("Arrived at %s, needed %s" % [_format_time(arrival_time), _format_time(cond.minutes)])
+		if msgs.size() > 0:
+			result[d.id] = msgs
+	return result
+
+
+# Stops every car's chained movement tween in place. Needed on a crash since
+# the whole journey is scheduled up front — without this, cars not directly
+# involved in the collision would keep gliding toward their house in the
+# background even after the simulation has already ended.
+func _kill_tweens(tweens: Dictionary) -> void:
+	for id in tweens.keys():
+		if is_instance_valid(tweens[id]):
+			tweens[id].kill()
 
 
 func _spawn_crash_marker(world_pos: Vector2) -> void:
@@ -925,7 +1124,18 @@ func _spawn_crash_marker(world_pos: Vector2) -> void:
 	get_tree().create_timer(2.0).timeout.connect(marker.queue_free)
 
 
-# ---- Reset / Clear / Next ----
+# ---- Reset / Clear / Next / Prev ----
+
+# Prev/Next are always visible so the player can browse levels freely without
+# completing one first — but disabled at the ends of the list, and while a
+# simulation is actively playing (jumping levels mid-sim would leave the old
+# _run_simulation() coroutine still suspended on a timer; it would resume
+# later holding stale state/UI for a level the player has since left).
+func _update_nav_buttons() -> void:
+	var busy: bool = state == State.PLAYING
+	prev_button.disabled = busy or current_level_index <= 0
+	next_button.disabled = busy or current_level_index + 1 >= LEVELS.size()
+
 
 func _reset_board(clear_paths: bool) -> void:
 	if clear_paths:
@@ -933,11 +1143,13 @@ func _reset_board(clear_paths: bool) -> void:
 			paths[d.id] = []
 	state = State.DRAWING
 	drawing_car_id = ""
+	violations = {}
 	for d in car_defs:
 		car_nodes[d.id].position = cell_to_world(d.entry.x, d.entry.y)
 	reset_button.hide()
-	next_button.hide()
 	clear_button.disabled = false
+	_update_clock(level_start_minutes)
+	_update_nav_buttons()
 	_check_ready()
 	_redraw_all()
 
@@ -953,3 +1165,8 @@ func _on_clear_pressed() -> void:
 func _on_next_pressed() -> void:
 	if current_level_index + 1 < LEVELS.size():
 		_load_level(current_level_index + 1)
+
+
+func _on_prev_pressed() -> void:
+	if current_level_index > 0:
+		_load_level(current_level_index - 1)

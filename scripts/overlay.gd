@@ -1,12 +1,14 @@
 extends Node2D
 class_name Overlay
 
+const VIOLATION_COLOR := Color(0.85, 0.25, 0.2)
+
 # Godot draws a parent's own _draw() content, then its children, on top of it —
 # so anything drawn inside game_board.gd's _draw() (roads, buildings, labels)
 # is structurally stuck underneath the Car/House child nodes. This node is
 # added with a higher z_index specifically so informational overlays (name
-# tags, fuel readout, hover tooltip) always render above every car and house,
-# regardless of where they happen to sit on the board.
+# tags, violation notes, hover tooltip) always render above every car and
+# house, regardless of where they happen to sit on the board.
 var board: Node2D = null
 
 
@@ -17,24 +19,25 @@ func _draw() -> void:
 		if item.type == "landmark":
 			var label_pos: Vector2 = item.rect.get_center() + Vector2(0.0, item.rect.size.y * 0.5 + 12.0 * board.draw_scale)
 			_draw_label_plate(item.name, label_pos, 12)
-	if board.state != board.State.PLAYING:
-		for d in board.car_defs:
-			_draw_fuel_tag(d)
-	if board.hovered_car_id != "":
+
+	# Violation notes are persistent (shown regardless of hover, until the
+	# player resets) — there's no live fuel/ETA readout while drawing on
+	# purpose, so this is the player's only feedback on what went wrong.
+	for id in board.violations.keys():
+		var d = board._get_car_def(id)
+		if d != null and board.car_nodes.has(id):
+			_draw_tooltip(board.car_nodes[id].position, _violation_lines(d), VIOLATION_COLOR)
+
+	if board.hovered_car_id != "" and not board.violations.has(board.hovered_car_id):
 		var hovered = board._get_car_def(board.hovered_car_id)
 		if hovered != null:
 			_draw_tooltip(board.car_nodes[hovered.id].position, board._car_tooltip_lines(hovered), hovered.color)
 
 
-func _draw_fuel_tag(d) -> void:
-	var cells: Array = board.paths.get(d.id, [])
-	if cells.is_empty():
-		return
-	var last_cell: Vector2i = cells[-1]
-	var tag_pos: Vector2 = board.cell_to_world(last_cell.x, last_cell.y) \
-		+ Vector2(board.cell_size * 0.5 + 6.0 * board.draw_scale, -board.cell_size * 0.5 - 6.0 * board.draw_scale)
-	var text: String = ("%d/%d" % [cells.size(), d.fuel]) if d.fuel >= 0 else "%d" % cells.size()
-	_draw_label_plate(text, tag_pos, 12)
+func _violation_lines(d) -> Array:
+	var lines: Array = [d.id.capitalize()]
+	lines.append_array(board.violations[d.id])
+	return lines
 
 
 # A name tag with its own opaque background, since whatever is underneath a

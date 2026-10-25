@@ -25,33 +25,50 @@ theme_override_font_sizes/font_size = 13
 text = "Hold SPACE to speed up time while cars are driving. Be careful to not crash any cars!"
 horizontal_alignment = 1
 
-[node name="PlayButton" type="Button" parent="UI" unique_id=520904929]
-offset_left = 300.0
+[node name="PrevButton" type="Button" parent="UI"]
+offset_left = 170.0
 offset_top = 764.0
-offset_right = 420.0
+offset_right = 270.0
+offset_bottom = 800.0
+disabled = true
+text = "< Prev"
+
+[node name="PlayButton" type="Button" parent="UI" unique_id=520904929]
+offset_left = 285.0
+offset_top = 764.0
+offset_right = 385.0
 offset_bottom = 800.0
 disabled = true
 text = "Play"
 
 [node name="ClearButton" type="Button" parent="UI" unique_id=1786366030]
-offset_left = 440.0
+offset_left = 400.0
 offset_top = 764.0
-offset_right = 560.0
+offset_right = 500.0
 offset_bottom = 800.0
 text = "Clear"
 
 [node name="ResetButton" type="Button" parent="UI" unique_id=1149897729]
 visible = false
-offset_left = 580.0
+offset_left = 515.0
 offset_top = 764.0
-offset_right = 700.0
+offset_right = 615.0
 offset_bottom = 800.0
 text = "Reset"
 
 [node name="NextButton" type="Button" parent="UI" unique_id=483524730]
-visible = false
-offset_left = 580.0
+offset_left = 630.0
 offset_top = 764.0
-offset_right = 700.0
+offset_right = 730.0
 offset_bottom = 800.0
-text = "Next Level"
+text = "Next >"
+
+[node name="ClockLabel" type="Label" parent="UI"]
+visible = false
+offset_left = 700.0
+offset_top = 20.0
+offset_right = 860.0
+offset_bottom = 50.0
+theme_override_font_sizes/font_size = 20
+horizontal_alignment = 2
+text = "Time: 00:00"
