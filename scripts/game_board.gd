@@ -40,6 +40,12 @@ class CarDef:
 	var color: Color
 	var entry: Vector2i
 	var house: Vector2i
+	# Where the House building is actually drawn — a non-road cell next to
+	# `house`, so the house sits beside the street like a real driveway
+	# instead of being painted on top of the asphalt. Filled in by
+	# _assign_house_cells() once a level's road layout is known; `house`
+	# itself stays the real gameplay destination (fuel, win check, sim).
+	var house_cell: Vector2i
 	var move_ticks: int = 2
 	var fuel: int = -1
 	var conditions: Array = []
@@ -132,6 +138,7 @@ func _make_car(id: String, color: Color, entry: Vector2i, house: Vector2i,
 	d.color = color
 	d.entry = entry
 	d.house = house
+	d.house_cell = house
 	d.move_ticks = move_ticks
 	d.fuel = fuel
 	d.conditions = conditions
@@ -140,6 +147,24 @@ func _make_car(id: String, color: Color, entry: Vector2i, house: Vector2i,
 
 func _make_landmark(name: String, cell: Vector2i, road_cell: Vector2i, color: Color) -> Dictionary:
 	return {"name": name, "cell": cell, "road_cell": road_cell, "color": color}
+
+
+# The non-road cell next to a house's road-cell destination where the House
+# building itself gets drawn. Tries the four neighbors in a fixed order and
+# falls back to the road cell itself only if a level design leaves no
+# adjacent block cell at all (shouldn't happen — every level's houses are
+# placed so at least one side isn't also a street).
+func _assign_house_cells(level: LevelDef) -> void:
+	var offsets := [Vector2i(-1, 0), Vector2i(0, 1), Vector2i(1, 0), Vector2i(0, -1)]
+	for d in level.cars:
+		d.house_cell = d.house
+		for off in offsets:
+			var n: Vector2i = d.house + off
+			if n.x < 1 or n.x > level.grid_size or n.y < 1 or n.y > level.grid_size:
+				continue
+			if not (level.road_rows.has(n.x) or level.road_cols.has(n.y)):
+				d.house_cell = n
+				break
 
 
 func _set_from(nums: Array) -> Dictionary:
@@ -161,6 +186,7 @@ func _build_levels() -> void:
 	]
 	level1.road_rows = _set_from([1, 4, 8])
 	level1.road_cols = _set_from([1, 4, 8])
+	_assign_house_cells(level1)
 	LEVELS.append(level1)
 
 	# Level 2: introduces fuel (max road length) — same layout shape as before.
@@ -172,40 +198,50 @@ func _build_levels() -> void:
 	]
 	level2.road_rows = _set_from([1, 5, 8])
 	level2.road_cols = _set_from([1, 5, 8])
+	_assign_house_cells(level2)
 	LEVELS.append(level2)
 
 	# Level 3: introduces differing speeds — red is fast, blue is slow.
+	# Blue's house sits one cell short of the grid corner (4,8) rather than
+	# (3,8) — a corner-adjacent road cell with both axes on the street grid
+	# would leave no non-road cell next to it for the house itself.
 	var level3 := LevelDef.new()
 	level3.grid_size = 8
 	level3.cars = [
 		_make_car("red", Color(0.85, 0.2, 0.2), Vector2i(0, 2), Vector2i(8, 7), 1, -1),
-		_make_car("blue", Color(0.2, 0.45, 0.9), Vector2i(7, 0), Vector2i(3, 8), 3, -1),
+		_make_car("blue", Color(0.2, 0.45, 0.9), Vector2i(7, 0), Vector2i(4, 8), 3, -1),
 	]
 	level3.road_rows = _set_from([1, 3, 6, 8])
 	level3.road_cols = _set_from([1, 4, 8])
+	_assign_house_cells(level3)
 	LEVELS.append(level3)
 
 	# Level 4: bigger grid, a third car, and the "avoid car" condition.
+	# Red's house is at (4,5), not the rows/cols intersection (5,5), for the
+	# same reason as level 3's blue house.
 	var level4 := LevelDef.new()
 	level4.grid_size = 10
 	level4.cars = [
-		_make_car("red", Color(0.85, 0.2, 0.2), Vector2i(0, 2), Vector2i(5, 5), 2, -1),
+		_make_car("red", Color(0.85, 0.2, 0.2), Vector2i(0, 2), Vector2i(4, 5), 2, -1),
 		_make_car("blue", Color(0.2, 0.45, 0.9), Vector2i(0, 8), Vector2i(6, 10), 2, -1),
 		_make_car("green", Color(0.25, 0.72, 0.35), Vector2i(6, 0), Vector2i(10, 3), 2, -1,
 			[{"type": "avoid_car", "other": "red"}]),
 	]
 	level4.road_rows = _set_from([1, 5, 10])
 	level4.road_cols = _set_from([1, 5, 10])
+	_assign_house_cells(level4)
 	LEVELS.append(level4)
 
 	# Level 5: smaller grid, tight fuel, differing speed, and named-building
 	# conditions — avoid the School, must pass the Market, avoid red's road.
+	# Both houses are nudged off the rows/cols intersections for the same
+	# "needs a non-road neighbor" reason as levels 3 and 4.
 	var level5 := LevelDef.new()
 	level5.grid_size = 6
 	level5.cars = [
-		_make_car("red", Color(0.85, 0.2, 0.2), Vector2i(0, 2), Vector2i(4, 1), 3, 6,
+		_make_car("red", Color(0.85, 0.2, 0.2), Vector2i(0, 2), Vector2i(3, 1), 3, 6,
 			[{"type": "avoid_building", "name": "School"}]),
-		_make_car("blue", Color(0.2, 0.45, 0.9), Vector2i(5, 0), Vector2i(4, 6), 1, 16,
+		_make_car("blue", Color(0.2, 0.45, 0.9), Vector2i(5, 0), Vector2i(3, 6), 1, 16,
 			[{"type": "require_building", "name": "Market"}, {"type": "avoid_car", "other": "red"}]),
 	]
 	level5.road_rows = _set_from([1, 4, 6])
@@ -214,6 +250,7 @@ func _build_levels() -> void:
 		_make_landmark("Market", Vector2i(2, 5), Vector2i(1, 5), MARKET_COLOR),
 		_make_landmark("School", Vector2i(5, 5), Vector2i(4, 5), SCHOOL_COLOR),
 	]
+	_assign_house_cells(level5)
 	LEVELS.append(level5)
 
 
@@ -243,7 +280,7 @@ func _load_level(index: int) -> void:
 		var house := House.new()
 		house.color = d.color
 		house.size = cell_size * 0.6
-		house.position = cell_to_world(d.house.x, d.house.y)
+		house.position = cell_to_world(d.house_cell.x, d.house_cell.y)
 		add_child(house)
 		house_nodes[d.id] = house
 
@@ -326,6 +363,14 @@ func _generate_block_decor() -> void:
 				var lm_rect := Rect2(lm_center - half * 0.8, half * 1.6)
 				placed.append(lm_rect)
 				block_decor.append({"type": "landmark", "rect": lm_rect, "color": lm.color, "name": lm.name})
+
+		# Reserve space for any car's house that lands in this block too, so a
+		# randomly-placed decorative building never overlaps it.
+		for d in car_defs:
+			var hc: Vector2i = d.house_cell
+			if hc.x >= block.r0 and hc.x <= block.r1 and hc.y >= block.c0 and hc.y <= block.c1:
+				var house_center: Vector2 = cell_to_world(hc.x, hc.y)
+				placed.append(Rect2(house_center - half * 0.8, half * 1.6))
 
 		var cell_count: int = (block.r1 - block.r0 + 1) * (block.c1 - block.c0 + 1)
 		var building_count: int = clampi(int(round(cell_count / 2.5)), 1, 5)
@@ -619,6 +664,8 @@ func _draw() -> void:
 	for d in car_defs:
 		_draw_start_highlight(d)
 	for d in car_defs:
+		_draw_driveway(d)
+	for d in car_defs:
 		_draw_path(d)
 
 
@@ -712,6 +759,29 @@ func _draw_start_highlight(d: CarDef) -> void:
 	draw_rect(Rect2(center - Vector2(half, half), Vector2(cell_size, cell_size)), highlight, true)
 
 
+# A short dashed "driveway" from the house's road-cell destination out to
+# where the building itself is drawn — marks exactly which cell the road
+# needs to reach. _draw_path() draws a solid line over this same stretch
+# once the player's road actually gets there, so the dash visually turns
+# into part of the connected road.
+func _draw_driveway(d: CarDef) -> void:
+	var from: Vector2 = cell_to_world(d.house.x, d.house.y)
+	var to: Vector2 = cell_to_world(d.house_cell.x, d.house_cell.y)
+	var total := from.distance_to(to)
+	if total <= 0.0:
+		return
+	var dir := (to - from) / total
+	var dash_len := 6.0 * draw_scale
+	var gap_len := 4.0 * draw_scale
+	var muted := d.color
+	muted.a = 0.55
+	var travelled := 0.0
+	while travelled < total:
+		var seg_end: float = min(travelled + dash_len, total)
+		draw_line(from + dir * travelled, from + dir * seg_end, muted, 4.0 * draw_scale)
+		travelled += dash_len + gap_len
+
+
 func _draw_path(d: CarDef) -> void:
 	var cells: Array = paths.get(d.id, [])
 	if cells.is_empty():
@@ -720,6 +790,8 @@ func _draw_path(d: CarDef) -> void:
 	pts.append(cell_to_world(d.entry.x, d.entry.y))
 	for c in cells:
 		pts.append(cell_to_world(c.x, c.y))
+	if cells[-1] == d.house:
+		pts.append(cell_to_world(d.house_cell.x, d.house_cell.y))
 	draw_polyline(pts, Color(0.0, 0.0, 0.0, 0.55), 14.0 * draw_scale, true)
 	draw_polyline(pts, d.color, 8.0 * draw_scale, true)
 	for c in cells:
@@ -754,10 +826,16 @@ func _expand_sequence(seq: Array, move_ticks: int) -> Array:
 
 
 func _run_simulation() -> void:
+	# Each car's own timeline runs straight from its entry, along its drawn
+	# road, and on into its house — house_cell is a private, non-road cell no
+	# other car's path can ever touch, so a car that finishes early keeps
+	# going into its driveway immediately instead of idling in the street
+	# until every other car has also arrived.
 	var sequences := {}
 	for d in car_defs:
 		var raw: Array = [d.entry]
 		raw.append_array(paths[d.id])
+		raw.append(d.house_cell)
 		sequences[d.id] = _expand_sequence(raw, max(1, d.move_ticks))
 
 	var max_len := 0
